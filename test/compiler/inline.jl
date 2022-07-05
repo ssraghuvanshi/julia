@@ -1334,7 +1334,6 @@ end
 @test f_finalizer_throws()
 
 # Test finalizers with static parameters
-global last_finalizer_type::Type = Any
 mutable struct DoAllocNoEscapeSparam{T}
     x::T
     function finalizer_sparam(d::DoAllocNoEscapeSparam{T}) where {T}

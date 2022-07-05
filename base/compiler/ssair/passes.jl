@@ -14,7 +14,7 @@ GetfieldUse(idx::Int)  = SSAUse(:getfield, idx)
 PreserveUse(idx::Int)  = SSAUse(:preserve, idx)
 NoPreserve()           = SSAUse(:nopreserve, 0)
 IsdefinedUse(idx::Int) = SSAUse(:isdefined, idx)
-AddFinalizerUse(idx::Int) = SSAUse(:add_finalizer, idx)
+FinalizerUse(idx::Int) = SSAUse(:finalizer, idx)
 
 """
     du::SSADefUse
@@ -882,7 +882,7 @@ function sroa_pass!(ir::IRCode, inlining::Union{Nothing, InliningState} = nothin
                 elseif is_isdefined
                     push!(defuse.uses, IsdefinedUse(idx))
                 elseif is_finalizer
-                    push!(defuse.uses, AddFinalizerUse(idx))
+                    push!(defuse.uses, FinalizerUse(idx))
                 else
                     push!(defuse.uses, GetfieldUse(idx))
                 end
@@ -1001,6 +1001,63 @@ function try_inline_finalizer!(ir::IRCode, argexprs::Vector{Any}, idx::Int, mi::
 end
 
 is_nothrow(ir::IRCode, pc::Int) = ir.stmts[pc][:flag] & (IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW) ≠ 0
+
+function try_inline_finalizer!(ir::IRCode, idx::Int, finalizer_idx::Int, defuse::SSADefUse, inlining::InliningState)
+    # For now: Require that all uses and defs are in the same basic block,
+    # so that live range calculations are easy.
+    bb = ir.cfg.blocks[block_for_inst(ir.cfg, first(defuse.uses).idx)]
+    minval::Int = typemax(Int)
+    maxval::Int = 0
+
+    function check_in_range(x::Union{Int,SSAUse})
+        if isa(x, SSAUse)
+            didx = x.idx
+        else
+            didx = x
+        end
+        didx in bb.stmts || return false
+        if didx < minval
+            minval = didx
+        end
+        if didx > maxval
+            maxval = didx
+        end
+        return true
+    end
+
+    check_in_range(idx) || return
+    _all(check_in_range, defuse.uses) || return
+    _all(check_in_range, defuse.defs) || return
+
+    # For now: Require all statements in the basic block range to be nothrow.
+    _all(minval:maxval) do idx::Int
+        return is_nothrow(ir, idx) || idx == finalizer_idx
+    end || return
+
+    # Ok, finalizer rewrite is legal.
+    finalizer_stmt = ir[SSAValue(finalizer_idx)][:inst]
+    argexprs = Any[finalizer_stmt.args[2], finalizer_stmt.args[3]]
+    mi = finalizer_stmt.args[5]::MethodInstance
+    if finalizer_stmt.args[4]::Bool # may inline
+        if try_inline_finalizer!(ir, argexprs, maxval, mi, inlining)
+            @goto done_finalizer
+        end
+        mi = compileable_specialization(inlining.et, mi, Effects()).invoke
+    end
+    if mi !== nothing
+        insert_node!(ir, maxval,
+            NewInstruction(Expr(:invoke, mi, argexprs...), Nothing),
+            true)
+    else
+        insert_node!(ir, maxval,
+            NewInstruction(Expr(:call, argexprs...), Nothing),
+            true)
+    end
+    @label done_finalizer
+    # Erase call to finalizer
+    ir[SSAValue(finalizer_idx)][:inst] = nothing
+end
+
 function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse}}, used_ssas::Vector{Int}, lazydomtree::LazyDomtree, inlining::Union{Nothing, InliningState})
     for (idx, (intermediaries, defuse)) in defuses
         intermediaries = collect(intermediaries)
@@ -1024,72 +1081,22 @@ function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse
         # error at runtime, but is not illegal to have in the IR.
         ismutabletype(typ) || continue
         typ = typ::DataType
-        # First check for any add_finalizer calls
-        add_finalizer_idx = nothing
+        # First check for any finalizer calls
+        finalizer_idx = nothing
         for use in defuse.uses
-            if use.kind === :add_finalizer
-                # For now: Only allow one add_finalizer per allocation
-                add_finalizer_idx !== nothing && @goto skip
-                add_finalizer_idx = use.idx
+            if use.kind === :finalizer
+                # For now: Only allow one finalizer per allocation
+                finalizer_idx !== nothing && @goto skip
+                finalizer_idx = use.idx
             end
         end
-        if add_finalizer_idx !== nothing
-            # For now: Require that all uses and defs are in the same basic block,
-            # so that live range calculations are easy.
-            bb = ir.cfg.blocks[block_for_inst(ir.cfg, first(defuse.uses).idx)]
-            minval::Int = typemax(Int)
-            maxval::Int = 0
-
-            check_in_range(defuse) = check_in_range(defuse.idx)
-            function check_in_range(didx::Int)
-                didx in bb.stmts || return false
-                if didx < minval
-                    minval = didx
-                end
-                if didx > maxval
-                    maxval = didx
-                end
-                return true
-            end
-
-            check_in_range(idx) || continue
-            _all(check_in_range, defuse.uses) || continue
-            _all(check_in_range, defuse.defs) || continue
-
-            # For now: Require all statements in the basic block range to be
-            # nothrow.
-            all_nothrow = _all(idx->is_nothrow(ir, idx) || idx == add_finalizer_idx, minval:maxval)
-            all_nothrow || continue
-
-            # Ok, finalizer rewrite is legal.
-            add_finalizer_stmt = ir[SSAValue(add_finalizer_idx)][:inst]
-            argexprs = Any[add_finalizer_stmt.args[2], add_finalizer_stmt.args[3]]
-            may_inline = add_finalizer_stmt.args[4]::Bool
-            mi = add_finalizer_stmt.args[5]::Union{MethodInstance, Nothing}
-            if may_inline && mi !== nothing
-                if try_inline_finalizer!(ir, argexprs, maxval, add_finalizer_stmt.args[5], inlining)
-                    @goto done_finalizer
-                end
-                mi = compileable_specialization(inlining.et, mi, Effects()).invoke
-            end
-            if mi !== nothing
-                insert_node!(ir, maxval,
-                    NewInstruction(Expr(:invoke, mi, argexprs...), Nothing),
-                    true)
-            else
-                insert_node!(ir, maxval,
-                    NewInstruction(Expr(:call, argexprs...), Nothing),
-                    true)
-            end
-            @label done_finalizer
-            # Erase call to add_finalizer
-            ir[SSAValue(add_finalizer_idx)][:inst] = nothing
+        if finalizer_idx !== nothing && inlining !== nothing
+            try_inline_finalizer!(ir, idx, finalizer_idx, defuse, inlining)
             continue
         end
         # Partition defuses by field
         fielddefuse = SSADefUse[SSADefUse() for _ = 1:fieldcount(typ)]
         all_eliminated = all_forwarded = true
-        has_finalizer = false
         for use in defuse.uses
             if use.kind === :preserve
                 for du in fielddefuse
