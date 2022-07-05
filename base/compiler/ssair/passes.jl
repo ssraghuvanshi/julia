@@ -742,7 +742,7 @@ its argument).
 In a case when all usages are fully eliminated, `struct` allocation may also be erased as
 a result of succeeding dead code elimination.
 """
-function sroa_pass!(ir::IRCode, inlining::Union{Nothing, InliningState} = nothing)
+function sroa_pass!(ir::IRCode)
     compact = IncrementalCompact(ir)
     defuses = nothing # will be initialized once we encounter mutability in order to reduce dynamic allocations
     lifting_cache = IdDict{Pair{AnySSAValue, Any}, AnySSAValue}()
@@ -775,11 +775,11 @@ function sroa_pass!(ir::IRCode, inlining::Union{Nothing, InliningState} = nothin
                 widenconst(field_ordering) === Bool && (field_ordering = :unspecified)
             end
         elseif is_known_call(stmt, Core.finalizer, compact)
-            3 <= length(stmt.args) <= 5 || continue
+            3 <= length(stmt.args) <= 4 || continue
             # Inlining performs legality checks on the finalizer to determine
             # whether or not we may inline it. If so, it appends extra arguments
             # at the end of the intrinsic. Detect that here.
-            length(stmt.args) == 5 || continue
+            length(stmt.args) == 4 || continue
             is_finalizer = true
         elseif isexpr(stmt, :foreigncall)
             nccallargs = length(stmt.args[3]::SimpleVector)
@@ -940,7 +940,7 @@ function sroa_pass!(ir::IRCode, inlining::Union{Nothing, InliningState} = nothin
         used_ssas = copy(compact.used_ssas)
         simple_dce!(compact, (x::SSAValue) -> used_ssas[x.id] -= 1)
         ir = complete(compact)
-        sroa_mutables!(ir, defuses, used_ssas, lazydomtree, inlining)
+        sroa_mutables!(ir, defuses, used_ssas, lazydomtree)
         return ir
     else
         simple_dce!(compact)
@@ -948,36 +948,32 @@ function sroa_pass!(ir::IRCode, inlining::Union{Nothing, InliningState} = nothin
     end
 end
 
-function try_inline_finalizer!(ir::IRCode, argexprs::Vector{Any}, idx::Int, mi::MethodInstance, inlining::InliningState)
-    code = get(inlining.mi_cache, mi, nothing)
-    if code isa CodeInstance
-        if use_const_api(code)
-            # No code in the function - Nothing to do
-            inlining.et !== nothing && push!(inlining.et, mi)
-            return true
-        end
-        src = code.inferred
-    else
-        src = code
+function inline_finalizer!(ir::IRCode, argexprs::Vector{Any}, idx::Int, @nospecialize(case))
+    if isa(case, ConstantCase)
+        # No code in the function - Nothing to do
+        return true
+    elseif isa(case, InvokeCase)
+        insert_node!(ir, idx, NewInstruction(Expr(:invoke, case.invoke, argexprs...), Nothing), true)
+        return true
+    elseif case === nothing
+        @assert false "this case should never happen"
     end
 
-    src = inlining_policy(inlining.interp, src, IR_FLAG_NULL, mi, Any[])
-    src === nothing && return false
-    src = retrieve_ir_for_inlining(mi, src)
+    # now try to inline the finalizer body
+    (; mi, spec) = case::InliningTodo
+    src = (spec::ResolvedInliningSpec).ir
 
     # For now: Require finalizer to only have one basic block
     length(src.cfg.blocks) == 1 || return false
 
     # Ok, we're committed to inlining the finalizer
-    inlining.et !== nothing && push!(inlining.et, mi)
 
     linetable_offset, extra_coverage_line = ir_inline_linetable!(ir.linetable, src, mi.def, ir[SSAValue(idx)][:line])
     if extra_coverage_line != 0
         insert_node!(ir, idx, NewInstruction(Expr(:code_coverage_effect), Nothing, extra_coverage_line))
     end
 
-    # TODO: Use the actual inliner here rather than open coding this special
-    # purpose inliner.
+    # TODO: Use the actual inliner here rather than open coding this special purpose inliner.
     spvals = mi.sparam_vals
     ssa_rename = Vector{Any}(undef, length(src.stmts))
     for idx′ = 1:length(src.stmts)
@@ -1002,7 +998,7 @@ end
 
 is_nothrow(ir::IRCode, pc::Int) = ir.stmts[pc][:flag] & (IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW) ≠ 0
 
-function try_inline_finalizer!(ir::IRCode, idx::Int, finalizer_idx::Int, defuse::SSADefUse, inlining::InliningState)
+function try_inline_finalizer!(ir::IRCode, idx::Int, finalizer_idx::Int, defuse::SSADefUse)
     # For now: Require that all uses and defs are in the same basic block,
     # so that live range calculations are easy.
     bb = ir.cfg.blocks[block_for_inst(ir.cfg, first(defuse.uses).idx)]
@@ -1025,40 +1021,30 @@ function try_inline_finalizer!(ir::IRCode, idx::Int, finalizer_idx::Int, defuse:
         return true
     end
 
-    check_in_range(idx) || return
-    _all(check_in_range, defuse.uses) || return
-    _all(check_in_range, defuse.defs) || return
+    check_in_range(idx) || return nothing
+    _all(check_in_range, defuse.uses) || return nothing
+    _all(check_in_range, defuse.defs) || return nothing
 
     # For now: Require all statements in the basic block range to be nothrow.
     _all(minval:maxval) do idx::Int
         return is_nothrow(ir, idx) || idx == finalizer_idx
-    end || return
+    end || return nothing
 
     # Ok, finalizer rewrite is legal.
     finalizer_stmt = ir[SSAValue(finalizer_idx)][:inst]
     argexprs = Any[finalizer_stmt.args[2], finalizer_stmt.args[3]]
-    mi = finalizer_stmt.args[5]::MethodInstance
-    if finalizer_stmt.args[4]::Bool # may inline
-        if try_inline_finalizer!(ir, argexprs, maxval, mi, inlining)
-            @goto done_finalizer
-        end
-        mi = compileable_specialization(inlining.et, mi, Effects()).invoke
-    end
-    if mi !== nothing
-        insert_node!(ir, maxval,
-            NewInstruction(Expr(:invoke, mi, argexprs...), Nothing),
-            true)
+    case = finalizer_stmt.args[4]
+    if inline_finalizer!(ir, argexprs, maxval, case)
+        # Erase call to finalizer
+        ir[SSAValue(finalizer_idx)][:inst] = nothing
     else
-        insert_node!(ir, maxval,
-            NewInstruction(Expr(:call, argexprs...), Nothing),
-            true)
+        pop!(finalizer_stmt.args)
+        @assert length(finalizer_stmt.args) == 3
     end
-    @label done_finalizer
-    # Erase call to finalizer
-    ir[SSAValue(finalizer_idx)][:inst] = nothing
+    return nothing
 end
 
-function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse}}, used_ssas::Vector{Int}, lazydomtree::LazyDomtree, inlining::Union{Nothing, InliningState})
+function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse}}, used_ssas::Vector{Int}, lazydomtree::LazyDomtree)
     for (idx, (intermediaries, defuse)) in defuses
         intermediaries = collect(intermediaries)
         # Check if there are any uses we did not account for. If so, the variable
@@ -1090,8 +1076,8 @@ function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse
                 finalizer_idx = use.idx
             end
         end
-        if finalizer_idx !== nothing && inlining !== nothing
-            try_inline_finalizer!(ir, idx, finalizer_idx, defuse, inlining)
+        if finalizer_idx !== nothing
+            try_inline_finalizer!(ir, idx, finalizer_idx, defuse)
             continue
         end
         # Partition defuses by field

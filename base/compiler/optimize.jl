@@ -578,7 +578,7 @@ function run_passes(
     @pass "Inlining"  ir = ssa_inlining_pass!(ir, ir.linetable, sv.inlining, ci.propagate_inbounds)
     # @timeit "verify 2" verify_ir(ir)
     @pass "compact 2" ir = compact!(ir)
-    @pass "SROA"      ir = sroa_pass!(ir, sv.inlining)
+    @pass "SROA"      ir = sroa_pass!(ir)
     @pass "ADCE"      ir = adce_pass!(ir)
     @pass "type lift" ir = type_lift_pass!(ir)
     @pass "compact 3" ir = compact!(ir)

@@ -1300,10 +1300,25 @@ mutable struct DoAllocNoEscape
         end
     end
 end
-
 let src = code_typed1() do
         for i = 1:1000
             DoAllocNoEscape()
+        end
+    end
+    @test count(isnew, src.code) == 0
+end
+
+# Test that we can inline a finalizer that just returns a constant value
+mutable struct DoAllocConst
+    function DoAllocConst()
+        finalizer(new()) do this
+            return nothing
+        end
+    end
+end
+let src = code_typed1() do
+        for i = 1:1000
+            DoAllocConst()
         end
     end
     @test count(isnew, src.code) == 0
@@ -1345,7 +1360,6 @@ mutable struct DoAllocNoEscapeSparam{T}
     end
 end
 DoAllocNoEscapeSparam(x::T) where {T} = DoAllocNoEscapeSparam{T}(x)
-
 let src = code_typed1(Tuple{Any}) do x
         for i = 1:1000
             DoAllocNoEscapeSparam(x)
@@ -1365,7 +1379,6 @@ mutable struct DoAllocNoEscapeNoInline
         finalizer(noinline_finalizer, new())
     end
 end
-
 let src = code_typed1() do
         for i = 1:1000
             DoAllocNoEscapeNoInline()
@@ -1373,6 +1386,30 @@ let src = code_typed1() do
     end
     @test count(isnew, src.code) == 1
     @test count(isinvoke(:noinline_finalizer), src.code) == 1
+end
+
+# Test that we don't form invalid `finalizer` call for cases we don't handle currently
+mutable struct DoAllocNoEscapeBranch
+    val::Int
+    function DoAllocNoEscapeBranch(val::Int)
+        finalizer(new(val)) do this
+            if this.val > 500
+                nothrow_side_effect(this.val)
+            else
+                nothrow_side_effect(nothing)
+            end
+        end
+    end
+end
+let src = code_typed1() do
+        for i = 1:1000
+            DoAllocNoEscapeBranch(i)
+        end
+    end
+    @test any(src.code) do @nospecialize x
+        iscall((src, Core.finalizer))(x) &&
+        length(x.args) == 3
+    end
 end
 
 # optimize `[push!|pushfirst!](::Vector{Any}, x...)`

@@ -1397,6 +1397,10 @@ function handle_finalizer_call!(
         infos = MethodMatchInfo[info]
     elseif isa(info, UnionSplitInfo)
         infos = info.matches
+    # elseif isa(info, ConstCallInfo)
+    #     # NOTE currently this code path isn't active as constant propagation won't happen
+    #     # for `Core.finalizer` call because inference currently isn't able to fold a mutable
+    #     # object as a constant
     else
         return nothing
     end
@@ -1413,14 +1417,7 @@ function handle_finalizer_call!(
     cases === nothing && return nothing
     cases, all_covered = cases
     if all_covered && length(cases) == 1
-        item1 = cases[1].item
-        if isa(item1, InliningTodo)
-            push!(stmt.args, true)
-            push!(stmt.args, item1.mi)
-        elseif isa(item1, InvokeCase)
-            push!(stmt.args, false)
-            push!(stmt.args, item1.invoke)
-        end
+        push!(stmt.args, cases[1].item)
     end
     return nothing
 end
