@@ -298,9 +298,9 @@ end
 
 # Used by Pkg but not used in loading itself
 function find_package(arg)
-    pkg = identify_package(arg)
+    pkg, env = identify_package_env(arg)
     pkg === nothing && return nothing
-    return locate_package(pkg)
+    return locate_package(pkg, env)
 end
 
 """
@@ -329,25 +329,31 @@ julia> Base.identify_package(LinearAlgebra, "Pkg") # Pkg is not a dependency of 
 
 ````
 """
-identify_package(where::Module, name::String) = identify_package(PkgId(where), name)
-function identify_package(where::PkgId, name::String)::Union{Nothing,PkgId}
-    where.name === name && return where
-    where.uuid === nothing && return identify_package(name) # ignore `where`
+identify_package_env(where::Module, name::String) = identify_package_env(PkgId(where), name)
+function identify_package_env(where::PkgId, name::String)
+    where.name === name && return where, nothing
+    where.uuid === nothing && return identify_package_env(name) # ignore `where`
     for env in load_path()
         pkgid = manifest_deps_get(env, where, name)
         pkgid === nothing && continue # not found--keep looking
-        pkgid.uuid === nothing || return pkgid # found in explicit environment--use it
+        pkgid.uuid === nothing || return pkgid, env # found in explicit environment--use it
         return nothing # found in implicit environment--return "not found"
     end
     return nothing
 end
-function identify_package(name::String)::Union{Nothing,PkgId}
+function identify_package_env(name::String)
     for env in load_path()
         uuid = project_deps_get(env, name)
-        uuid === nothing || return uuid # found--return it
+        uuid === nothing || return uuid, env # found--return it
     end
     return nothing
 end
+
+_nothing_or_first(x) = x === nothing ? nothing : first(x)
+identify_package(where::Module, name::String) = _nothing_or_first(identify_package_env(where, name))
+identify_package(where::PkgId, name::String)  = _nothing_or_first(identify_package_env(where, name))
+identify_package(name::String)                = _nothing_or_first(identify_package_env(name))
+
 
 """
     Base.locate_package(pkg::PkgId)::Union{String, Nothing}
@@ -363,7 +369,7 @@ julia> Base.locate_package(pkg)
 "/path/to/julia/stdlib/v$(VERSION.major).$(VERSION.minor)/Pkg/src/Pkg.jl"
 ```
 """
-function locate_package(pkg::PkgId)::Union{Nothing,String}
+function locate_package(pkg::PkgId, stopenv::Union{String, Nothing}=nothing)::Union{Nothing,String}
     if pkg.uuid === nothing
         for env in load_path()
             # look for the toplevel pkg `pkg.name` in this entry
@@ -377,11 +383,13 @@ function locate_package(pkg::PkgId)::Union{Nothing,String}
                     return implicit_manifest_uuid_path(env, pkg)
                 end
             end
+            stopenv == env && return nothing
         end
     else
         for env in load_path()
             path = manifest_uuid_path(env, pkg)
             path === nothing || return entry_path(path, pkg.name)
+            stopenv == env && return nothing
         end
         # Allow loading of stdlibs if the name/uuid are given
         # e.g. if they have been explicitly added to the project/manifest
@@ -1312,8 +1320,8 @@ function require(into::Module, mod::Symbol)
     @lock require_lock begin
     LOADING_CACHE[] = LoadingCache()
     try
-        uuidkey = identify_package(into, String(mod))
-        # Core.println("require($(PkgId(into)), $mod) -> $uuidkey")
+        uuidkey, env = identify_package_env(into, String(mod))
+        # Core.println("require($(PkgId(into)), $mod) -> $uuidkey from env \"$env\"")
         if uuidkey === nothing
             where = PkgId(into)
             if where.uuid === nothing
@@ -1345,7 +1353,7 @@ function require(into::Module, mod::Symbol)
         if _track_dependencies[]
             push!(_require_dependencies, (into, binpack(uuidkey), 0.0))
         end
-        return _require_prelocked(uuidkey)
+        return _require_prelocked(uuidkey, env)
     finally
         LOADING_CACHE[] = nothing
     end
@@ -1363,10 +1371,10 @@ const pkgorigins = Dict{PkgId,PkgOrigin}()
 
 require(uuidkey::PkgId) = @lock require_lock _require_prelocked(uuidkey)
 
-function _require_prelocked(uuidkey::PkgId)
+function _require_prelocked(uuidkey::PkgId, env=nothing)
     assert_havelock(require_lock)
     if !root_module_exists(uuidkey)
-        newm = _require(uuidkey)
+        newm = _require(uuidkey, env)
         if newm === nothing
             error("package `$(uuidkey.name)` did not define the expected \
                   module `$(uuidkey.name)`, check for typos in package module name")
@@ -1455,7 +1463,7 @@ function set_pkgorigin_version_path(pkg::PkgId, path::Union{String,Nothing})
 end
 
 # Returns `nothing` or the new(ish) module
-function _require(pkg::PkgId)
+function _require(pkg::PkgId, env=nothing)
     assert_havelock(require_lock)
     # handle recursive calls to require
     loading = get(package_locks, pkg, false)
@@ -1470,7 +1478,7 @@ function _require(pkg::PkgId)
     try
         toplevel_load[] = false
         # perform the search operation to select the module file require intends to load
-        path = locate_package(pkg)
+        path = locate_package(pkg, env)
         if path === nothing
             throw(ArgumentError("""
                 Package $pkg is required but does not seem to be installed:
