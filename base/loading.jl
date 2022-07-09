@@ -868,70 +868,69 @@ const TIMING_IMPORTS = Threads.Atomic{Int}(0)
 
 collect_installed_weak_deps(where::Module) = collect_installed_weak_deps(PkgId(where))
 function collect_installed_weak_deps(where::PkgId)
-    weak_deps = collect_weak_deps(where)
+    weak_deps, env = collect_weak_deps(where)
     # Now filter only those that are installed.
     weak_deps_installed = filter(weak_deps) do (name, uuid)
-        locate_package(PkgId(uuid, name)) !== nothing
+        locate_package(PkgId(uuid, name), env) !== nothing
     end
     return weak_deps_installed
 end
 function collect_weak_deps(where::PkgId)
     # Check if this is the project
-    envs = Base.load_path()
-    isempty(envs) && return nothing
-    env = first(envs)
-    project_file = env_project_file(env)
-    project_file isa String || return Dict{String, UUID}()
-    proj = project_file_name_uuid(project_file, where.name)
-    if proj == where
-        d = parsed_toml(project_file)
-        weak_deps = get(d, "weakdeps", nothing)::Union{Dict{String, Any}, Nothing}
-        weak_deps === nothing && return Dict{String, UUID}()
-        return Dict{String, UUID}(k => UUID(v::String) for (k,v) in weak_deps)
-    else
-        manifest_file = project_file_manifest_path(project_file)
-        manifest_file === nothing && return Dict{String, UUID}()
-        d = get_deps(parsed_toml(manifest_file))
-        for (dep_name, entries) in d
-            entries::Vector{Any}
-            for entry in entries
-                entry = entry::Dict{String, Any}
-                uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
-                uuid === nothing && continue
-                if UUID(uuid) === where.uuid
-                    deps = get(entry, "weakdeps", nothing)::Union{Vector{String}, Dict{String, Any}, Nothing}
-                    if deps isa Vector{String}
-                        # Now we need to collect the UUIDs for all these
-                        d_weak = Dict{String, UUID}()
-                        for name in deps
-                            name_deps = get(d, name, nothing)::Union{Nothing, Vector{Any}}
-                            if name_deps === nothing || length(name_deps) != 1
-                                error("expected a single entry for $(repr(name)) in $(repr(project_file))")
+    for env in Base.load_path()
+        project_file = env_project_file(env)
+        project_file isa String || return Dict{String, UUID}(), env
+        proj = project_file_name_uuid(project_file, where.name)
+        if proj == where
+            d = parsed_toml(project_file)
+            weak_deps = get(d, "weakdeps", nothing)::Union{Dict{String, Any}, Nothing}
+            weak_deps === nothing && return Dict{String, UUID}()
+            return Dict{String, UUID}(k => UUID(v::String) for (k,v) in weak_deps), env
+        else
+            manifest_file = project_file_manifest_path(project_file)
+            manifest_file === nothing && return Dict{String, UUID}()
+            d = get_deps(parsed_toml(manifest_file))
+            for (dep_name, entries) in d
+                entries::Vector{Any}
+                for entry in entries
+                    entry = entry::Dict{String, Any}
+                    uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
+                    uuid === nothing && continue
+                    if UUID(uuid) === where.uuid
+                        deps = get(entry, "weakdeps", nothing)::Union{Vector{String}, Dict{String, Any}, Nothing}
+                        if deps isa Vector{String}
+                            # Now we need to collect the UUIDs for all these
+                            d_weak = Dict{String, UUID}()
+                            for name in deps
+                                name_deps = get(d, name, nothing)::Union{Nothing, Vector{Any}}
+                                if name_deps === nothing || length(name_deps) != 1
+                                    error("expected a single entry for $(repr(name)) in $(repr(project_file))")
+                                end
+                                entry = first(name_deps::Vector{Any})::Dict{String, Any}
+                                uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
+                                if uuid !== nothing
+                                    d_weak[name] = UUID(uuid)
+                                end
                             end
-                            entry = first(name_deps::Vector{Any})::Dict{String, Any}
-                            uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
-                            if uuid !== nothing
-                                d_weak[name] = UUID(uuid)
-                            end
+                            return d_weak, env
+                        elseif deps isa Dict{String, Any}
+                            return Dict{String, UUID}(k => UUID(v::String) for (k,v) in deps), env
                         end
-                        return d_weak
-                    elseif deps isa Dict{String, Any}
-                        return Dict{String, UUID}(k => UUID(v::String) for (k,v) in deps)
                     end
                 end
             end
         end
     end
-    return Dict{String, UUID}()
+    return Dict{String, UUID}(), nothing
 end
 
 hasdep(m::Module, deps::Symbol...) = hasdep(PkgId(m), deps...)
 
 function hasdep(pkg::PkgId, deps::Symbol...)
     for dep in deps
-        wpkg = identify_package(pkg, String(dep))
+        wpkg, env = identify_package_env(pkg, String(dep))
         wpkg === nothing && return false
-        locate_package(wpkg) === nothing && return false
+        locate_package(wpkg, env) === nothing && return false
     end
     return true
 end
